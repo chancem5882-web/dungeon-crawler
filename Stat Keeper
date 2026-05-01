@@ -1,0 +1,192 @@
+import json
+import os
+from flask import Flask, render_template_string, request
+from flask_socketio import SocketIO, join_room, emit
+
+app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+VALID_STATS = ["Strength", "Intelligence", "Dexterity", "Constitution", "Charisma"]
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
+
+ROOMS = {}
+OWNERS = {}
+
+class Character:
+    def __init__(self, name):
+        self.name = name
+        self.base_stats = {stat: 0 for stat in VALID_STATS}
+        self.buffs = []
+        self.debuffs = []
+
+    def set_stat(self, stat, value):
+        self.base_stats[stat] = int(value)
+
+    def total(self, stat):
+        total = self.base_stats[stat]
+        total += sum(v for s, v, _ in self.buffs if s == stat)
+        total -= sum(v for s, v, _ in self.debuffs if s == stat)
+        return total
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "base_stats": self.base_stats,
+            "buffs": self.buffs,
+            "debuffs": self.debuffs,
+        }
+
+    @staticmethod
+    def from_dict(d):
+        c = Character(d["name"])
+        c.base_stats = d["base_stats"]
+        c.buffs = d["buffs"]
+        c.debuffs = d["debuffs"]
+        return c
+
+
+def room_file(room):
+    safe = "".join(ch for ch in room if ch.isalnum() or ch in "-_")
+    return os.path.join(DATA_DIR, f"{safe}.json")
+
+
+def save_room(room):
+    data = {n: c.to_dict() for n, c in ROOMS.get(room, {}).items()}
+    with open(room_file(room), "w") as f:
+        json.dump(data, f)
+
+
+def load_room(room):
+    path = room_file(room)
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        raw = json.load(f)
+    return {n: Character.from_dict(d) for n, d in raw.items()}
+
+
+def serialize_room(room):
+    return {n: c.to_dict() for n, c in ROOMS.get(room, {}).items()}
+
+
+TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+<title>DCC Tracker</title>
+<script src="https://cdn.socket.io/4.0.1/socket.io.min.js"></script>
+<style>
+body { background:#000; color:#f5d76e; font-family: monospace; }
+.card { border:1px solid red; margin:10px; padding:10px; }
+button { background:black; color:red; border:1px solid red; }
+</style>
+</head>
+<body>
+
+<div class="card">
+<h2>Join Room</h2>
+<input id="room">
+<button onclick="joinRoom()">Join</button>
+<button onclick="saveRoom()">Save</button>
+</div>
+
+<div class="card">
+<h2>Create Character</h2>
+<input id="charName">
+<button onclick="createChar()">Create</button>
+</div>
+
+<div id="characters"></div>
+
+<script>
+var socket = io();
+var currentRoom = "";
+
+function joinRoom() {
+  currentRoom = document.getElementById("room").value;
+  socket.emit("join", {room: currentRoom});
+}
+
+function saveRoom() {
+  socket.emit("save", {room: currentRoom});
+}
+
+function createChar() {
+  let name = document.getElementById("charName").value;
+  socket.emit("create_char", {room: currentRoom, name});
+}
+
+function setStat(name, stat) {
+  let val = document.getElementById(name+"_"+stat).value;
+  socket.emit("set_stat", {room: currentRoom, name, stat, value: val});
+}
+
+function updateUI(data) {
+  let div = document.getElementById("characters");
+  div.innerHTML = "";
+
+  for (let name in data) {
+    let c = data[name];
+    let html = "<div class='card'><h3>"+name+"</h3>";
+
+    for (let stat in c.base_stats) {
+      html += stat+": "+c.base_stats[stat] +
+      " <input id='"+name+"_"+stat+"' type='number'>" +
+      " <button onclick=\"setStat('"+name+"','"+stat+"')\">Set</button><br>";
+    }
+
+    html += "</div>";
+    div.innerHTML += html;
+  }
+}
+
+socket.on("update", updateUI);
+</script>
+
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    return render_template_string(TEMPLATE)
+
+
+@socketio.on("join")
+def on_join(data):
+    room = data["room"]
+    join_room(room)
+    if room not in ROOMS:
+        ROOMS[room] = load_room(room)
+        OWNERS[room] = {}
+    emit("update", serialize_room(room), room=room)
+
+
+@socketio.on("create_char")
+def create_char(data):
+    room = data["room"]
+    name = data["name"]
+    sid = request.sid
+
+    if name not in ROOMS[room]:
+        ROOMS[room][name] = Character(name)
+        OWNERS[room][name] = sid
+
+    emit("update", serialize_room(room), room=room)
+
+
+@socketio.on("set_stat")
+def set_stat(data):
+    if OWNERS[data["room"]].get(data["name"]) == request.sid:
+        ROOMS[data["room"]][data["name"]].set_stat(data["stat"], data["value"])
+        emit("update", serialize_room(data["room"]), room=data["room"])
+
+
+@socketio.on("save")
+def save(data):
+    save_room(data["room"])
+
+
+if __name__ == "__main__":
+    socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
